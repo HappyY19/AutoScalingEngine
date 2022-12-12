@@ -699,14 +699,15 @@ class LifeCycleManager:
         self.logger.debug('process')
         # Get the engine so we can process it
         engine = self.cxsast_api.get_engine_by_name(self.instance_id)
-        # ignore the engine in cx manager server
-        if engine_in_manager_ip in engine['uri']:
-            return
         # Immediately complete the hook when the engine is not registered and termination hook has been received
         if engine is None:
             logger.debug("No engine exists for name %s" % self.instance_id)
             self.__complete_lifecycle_hook()
             return  # nothing else to do in this scenario
+
+        # ignore the engine in cx manager server
+        if engine_in_manager_ip in engine['uri']:
+            return
 
         status = int(engine['status']['id'])
         # Make sure the engine is blocked
