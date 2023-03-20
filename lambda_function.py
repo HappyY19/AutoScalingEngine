@@ -79,15 +79,20 @@ class CxSastRestApi:
         logger.info("body username %s" % username)
         try:
             response = http.request('POST', url, headers=headers, body=encoded_body)
-            json_data = json.loads(response.data.decode('utf-8'))
-            token_type = json_data['token_type']
-            access_t = json_data['access_token']
-            token = token_type + " " + access_t
-            self.headers = {
-                'Authorization': token,
-                'Content-Type': 'application/json;v=1.0'
-            }
-            logger.info("get the token")
+            response_status = response.status
+            response_data = response.data.decode('utf-8')
+            if response_status == 200:
+                json_data = json.loads(response_data)
+                token_type = json_data['token_type']
+                access_t = json_data['access_token']
+                token = token_type + " " + access_t
+                self.headers = {
+                    'Authorization': token,
+                    'Content-Type': 'application/json;v=1.0'
+                }
+                logger.info("successfully get the token")
+            else:
+                self.logger.error(f'login failed. response status: {response.status}, response data: {response_data}')
 
         except urllib3.exceptions.NewConnectionError:
             self.logger.error('Could not log in to %s', url)
