@@ -277,7 +277,7 @@ class ScanQueueDepth:
         [self.small_queue_depth, self.medium_queue_depth, self.large_queue_depth,
          self.xlarge_queue_depth,
          self.xxlarge_queue_depth,
-         self.xxxlarge_queue_depth] = get_number_of_queued_scans_for_each_engine_size_in_queue()
+         self.xxxlarge_queue_depth] = get_number_of_queued_scans_for_each_engine_size_in_queue(cx_api=self.cxsast_api)
         # how many servers for each engine size
         engines_of_each_size = get_list_of_engines_for_each_engine_size()
         self.small_queue_depth -= len(engines_of_each_size[0])
@@ -301,14 +301,14 @@ class ScanQueueDepth:
             self.xxxlarge_queue_depth = 0
 
 
-def get_number_of_queued_scans_for_each_engine_size_in_queue():
+def get_number_of_queued_scans_for_each_engine_size_in_queue(cx_api):
     small_queue_depth = 0
     medium_queue_depth = 0
     large_queue_depth = 0
     xlarge_queue_depth = 0
     xxlarge_queue_depth = 0
     xxxlarge_queue_depth = 0
-    current_queue = CxSastRestApi().get_scan_queue()
+    current_queue = cx_api.get_scan_queue()
     for scan in current_queue:
         if scan['stage']['id'] != SCAN_STAGE_QUEUED:
             continue
@@ -336,18 +336,18 @@ def get_list_of_engines_for_each_engine_size():
 
 class ScanQueueDepthMetricsPublisher:
 
-    def __init__(self, scan_queue_depth, environment):
+    def __init__(self, scan_queue_depth, environment, cx_sast_api):
         self.logger = logging.getLogger('ScanQueueDepthMetricsPublisher')
         self.cloudwatch = boto3.resource('cloudwatch')
         self.metric_namespace = "checkmarx/cxsast/%s" % environment
         self.metric_namespace = "Cx"
         self.scan_queue_depth = scan_queue_depth
         self.environment = environment
+        self.cx_sast_api = cx_sast_api
 
-    @staticmethod
-    def is_engine_status(ec2, status="idle"):
+    def is_engine_status(self, ec2, status="idle"):
         instance_id = ec2.instanceid
-        all_engine_servers = CxSastRestApi().get_all_engine_server_details()
+        all_engine_servers = self.cx_sast_api.get_all_engine_server_details()
         for engine in all_engine_servers:
             if engine.get("name") == instance_id and engine.get("status").get("value") == status:
                 return True
@@ -536,7 +536,7 @@ class EngineRegistrar:
                         self.logger.debug(
                             "Skipping registration of %s because the swagger page is not live yet" % ec2.enginename)
                 except urllib3.exceptions.NewConnectionError:
-                    self.logger.error('Error pinging swagger/index.html on %s' % ec2.enginename)
+                    self.logger.info('swagger page not online yet, pinging swagger/index.html on %s' % ec2.enginename)
 
 
 class TerminationProtectionManager:
@@ -557,7 +557,7 @@ class TerminationProtectionManager:
         for engine in self.cxsast_api.get_engines():
             ec2 = self.__find_ec2_by_name(ec2s, engine['name'])
             if ec2 is not None:
-                if engine['status']['id'] == ENGINE_STATUS_SCANNING:
+                if engine['status']['id'] in (ENGINE_STATUS_SCANNINGANDBLOCKED, ENGINE_STATUS_SCANNING):
                     self.ec2_api.set_instance_protection(ec2, True)
                 else:
                     self.ec2_api.set_instance_protection(ec2, False)
@@ -581,9 +581,9 @@ class QueueManager:
         # Calculate the scan queue depth
         queue_depth_calculator = ScanQueueDepth(self.cxsast_api)
         queue_depth_calculator.calculate_queue_depth()
-
+        cx_env = os.environ['CheckmarxEnvironment']
         # Publish scan queue depth metrics to cloudwatch
-        metrics_publisher = ScanQueueDepthMetricsPublisher(queue_depth_calculator, os.environ['CheckmarxEnvironment'])
+        metrics_publisher = ScanQueueDepthMetricsPublisher(queue_depth_calculator, cx_env, self.cxsast_api)
         metrics_publisher.publish()
 
 
@@ -643,17 +643,19 @@ class LifeCycleManager:
         self.event = event
         message = json.loads(event['Records'][0]['Sns']['Message'])
         self.message_id = event['Records'][0]['Sns']['MessageId']
-        self.instance_id = message['EC2InstanceId']
+        self.instance_id = message.get('EC2InstanceId')
 
-        self.lifecycle_hook_name = message['LifecycleHookName']
-        self.instance_id = message['EC2InstanceId']
-        self.lifecycle_action_token = message['LifecycleActionToken']
-        self.autoscaling_group_name = message['AutoScalingGroupName']
+        self.lifecycle_hook_name = message.get('LifecycleHookName')
+        self.instance_id = message.get('EC2InstanceId')
+        self.lifecycle_action_token = message.get('LifecycleActionToken')
+        self.autoscaling_group_name = message.get('AutoScalingGroupName')
 
     def __complete_lifecycle_hook(self):
         self.logger.debug('__complete_lifecycle_hook')
         self.logger.info('Completing lifecycle hook %s %s %s' % (
             self.lifecycle_hook_name, self.autoscaling_group_name, self.instance_id))
+        if self.lifecycle_hook_name is None:
+            return
         client = boto3.client('autoscaling')
         try:
             response = client.complete_lifecycle_action(
@@ -686,7 +688,8 @@ class LifeCycleManager:
         self.logger.debug('__record_lifecycle_action_heartbeat')
         self.logger.info('Recording heartbeat for %s %s %s' % (
             self.lifecycle_hook_name, self.autoscaling_group_name, self.instance_id))
-
+        if self.lifecycle_hook_name is None:
+            return
         client = boto3.client('autoscaling')
         client.record_lifecycle_action_heartbeat(
             LifecycleHookName=self.lifecycle_hook_name,
@@ -728,7 +731,7 @@ def lambda_handler(event, context):
     ec2_api = Ec2Api(os.environ['CheckmarxEnvironment'])
     logger.info("Start processing event")
     cx_sast_api = CxSastRestApi()
-    cx_sast_api.register_local_engine_if_missing(f"http://{engine_in_manager_ip}:8088")
+    cx_sast_api.register_local_engine_if_missing(f"http://{engine_in_manager_ip}:8088/")
     if 'Records' in event:
         logger.info('invoked from sns')
         receiver = LifecycleEventReceiver(event, cx_sast_api)
